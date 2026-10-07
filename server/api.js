@@ -48,9 +48,13 @@ function overview(data) {
     invalidFlagCount: data.readings.filter((r) => r.flag !== '有效').length,
     reportCount: data.reports.length,
     submittedReportCount: data.reports.filter((r) => r.status === '已上报').length,
-    exceededOutletCount: outletRows.filter((s) => s.rows.some((r) => r.exceeded)).length,
+    exceededOutletCount: outletRows.filter((s) => s.rows.some(
+      (r) => r.exceeded && s.hierarchy.byMetric[r.metric] && s.hierarchy.byMetric[r.metric].counted
+    )).length,
     accumulatedCodTons: monitor.accumulatedTons(data, 'COD'),
     accumulatedAmmoniaTons: monitor.accumulatedTons(data, '氨氮'),
+    flatAccumulatedCodTons: monitor.flatAccumulatedTons(data, 'COD'),
+    flatAccumulatedAmmoniaTons: monitor.flatAccumulatedTons(data, '氨氮'),
     permitCodTons: Number(settings.annualPermitCodTons),
     permitAmmoniaTons: Number(settings.annualPermitAmmoniaTons),
     settings: {
@@ -72,6 +76,13 @@ function overview(data) {
       type: s.outlet.type,
       plantCode: s.plant ? s.plant.code : '',
       plantName: s.plant ? s.plant.name : '',
+      parentId: s.hierarchy.parentId,
+      parentCode: s.hierarchy.parentCode,
+      depth: s.hierarchy.depth,
+      path: s.hierarchy.path,
+      roleByMetric: { COD: s.hierarchy.byMetric.COD && s.hierarchy.byMetric.COD.role, 氨氮: s.hierarchy.byMetric['氨氮'] && s.hierarchy.byMetric['氨氮'].role },
+      countedByMetric: { COD: !!(s.hierarchy.byMetric.COD && s.hierarchy.byMetric.COD.counted), 氨氮: !!(s.hierarchy.byMetric['氨氮'] && s.hierarchy.byMetric['氨氮'].counted) },
+      basisByMetric: { COD: s.hierarchy.byMetric.COD && s.hierarchy.byMetric.COD.basis, 氨氮: s.hierarchy.byMetric['氨氮'] && s.hierarchy.byMetric['氨氮'].basis },
       deviceCount: s.devices.length,
       rows: s.rows,
       accumulatedCodTons: s.accumulatedCodTons,
@@ -112,6 +123,33 @@ router.get('/outlets/:id/exceedance', withData((data, req) => {
   const month = req.query.month || currentMonth(data);
   const metrics = req.query.metric ? [req.query.metric] : ['COD', '氨氮'];
   return metrics.map((metric) => monitor.exceedance(data, req.params.id, metric, month));
+}));
+
+// 层级与一键核对：无 plantId = 集团口径，带 plantId = 单位口径；metrics 各出平铺/去重/差额/逐口台账
+router.get('/hierarchy', withData((data, req) => {
+  const month = req.query.month || currentMonth(data);
+  const plantId = req.query.plantId || '';
+  if (plantId && !data.plants.some((p) => p.id === plantId)) {
+    throw new AppError(404, 'PLANT_NOT_FOUND', '这个排污单位不存在');
+  }
+  const metrics = {};
+  for (const metric of ['COD', '氨氮']) {
+    metrics[metric] = monitor.hierarchyRollup(data, { month, metric, plantId });
+  }
+  return {
+    month,
+    scope: plantId ? 'plant' : 'group',
+    plantId,
+    plant: plantId ? data.plants.find((p) => p.id === plantId) || null : null,
+    trees: monitor.outletTree(data, plantId),
+    policy: [
+      '外排口（无上级的总排口/独立排口）当月有计量的，以其实测为准；',
+      '出水汇入上级的车间/过程排口不累计，其计量视为已含在上级中（标「重复计入」）；',
+      '外排口当月无计量时，沿层级取第一个有计量的下级排口替代，并写明依据；',
+      '「平铺合计」逐口相加、含重复，仅作对照；对外数字一律用「去重合计」。',
+    ],
+    metrics,
+  };
 }));
 
 router.get('/devices', withData((data, req) => res.listDevices(data, req.query)));

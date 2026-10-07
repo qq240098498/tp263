@@ -387,3 +387,45 @@ tr.expand-row > td {
 .summary-cell .v { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .mini-table table { font-size: 12px; }
 .inline-actions { display: flex; gap: 6px; }
+
+/* ---------- 排放口层级与核对 ---------- */
+.tag-muted { background: var(--card-alt); border-color: var(--line); color: var(--ink-3); }
+.num-muted { color: var(--ink-3); }
+.row-muted { background: var(--card-alt); }
+.row-muted:hover { background: #efece5; }
+
+.tree-name { white-space: nowrap; }
+.tree-name .sub { font-size: 11px; color: var(--ink-3); font-weight: 400; }
+.tree-guide { color: var(--ink-3); user-select: none; margin-right: 2px; }
+
+.group-sep-row td { background: #efece5; border-top: 1px solid var(--line); }
+.group-sep { padding: 6px 10px !important; color: var(--ink); font-size: 13px; }
+
+.basis-cell { font-size: 11px; color: var(--ink-3); min-width: 220px; }
+.basis-line { margin-bottom: 2px; }
+
+.policy-list { margin: 0; padding-left: 20px; color: var(--ink-2); font-size: 13px; line-height: 1.9; }
+
+.recon-metric { border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 12px; background: var(--card); }
+.recon-metric h3 { margin: 0 0 10px; font-size: 14px; }
+.recon-flow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }
+.recon-pill {
+  display: inline-flex; flex-direction: column; gap: 2px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--card-alt); padding: 6px 12px; font-size: 11px; color: var(--ink-3);
+}
+.recon-pill b { font-size: 15px; color: var(--ink); }
+.recon-pill-ok { background: var(--ok-soft); border-color: #bfdccc; }
+.recon-pill-ok b { color: var(--ok); }
+.recon-pill-bad { background: var(--danger-soft); border-color: #e8c2bd; }
+.recon-pill-bad b { color: var(--danger); }
+.recon-arrow { color: var(--ink-3); font-size: 12px; }
+
+.recon-check { border-radius: var(--radius); padding: 8px 12px; font-size: 13px; margin-bottom: 8px; }
+.recon-check.is-ok { background: var(--ok-soft); color: var(--ok); border: 1px solid #bfdccc; }
+.recon-check.is-bad { background: var(--danger-soft); color: var(--danger); border: 1px solid #e8c2bd; font-weight: 600; }
+.recon-sources ul { margin: 6px 0 0; padding-left: 20px; font-size: 12px; color: var(--ink-2); line-height: 1.8; }
+.recon-diffsrc { margin: 6px 0 0; padding-left: 20px; font-size: 12px; color: var(--danger); }
+
+.report-rollup-strip { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.report-rollup-strip .recon-check { margin-bottom: 0; font-size: 12px; }

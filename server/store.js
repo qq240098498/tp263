@@ -25,6 +25,11 @@ function normalize(raw) {
   for (const key of ['plants', 'outlets', 'devices', 'readings', 'reports']) {
     if (!Array.isArray(data[key])) data[key] = [];
   }
+  // 层级：parentId 为空表示顶层外排口/独立排口，非空表示出水汇入上级（车间/过程排口）
+  for (const outlet of data.outlets) {
+    if (outlet.parentId === undefined || outlet.parentId === null) outlet.parentId = '';
+    else outlet.parentId = String(outlet.parentId);
+  }
   return data;
 }
 

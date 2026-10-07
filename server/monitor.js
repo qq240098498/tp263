@@ -150,13 +150,26 @@ function quarterPermitTons(data, metric, quarter) {
   return store.round(annual / 4, 4);
 }
 
-// 年累计：把库里的全部数据加起来
-function accumulatedTons(data, metric) {
-  const outlets = data.outlets.map((o) => o.id);
+// 年累计（平铺口径，仅对照用）：把范围内每个排放口逐月累加，含总排口/车间排口重复计量
+function flatAccumulatedTons(data, metric, plantId) {
+  const scopeIds = new Set(outletsInScope(data, plantId).map((o) => o.id));
   let total = 0;
-  for (const outletId of outlets) {
+  for (const outletId of scopeIds) {
     const months = Array.from(new Set(data.readings.filter((r) => r.outletId === outletId && r.metric === metric).map((r) => store.monthOf(r.at))));
     for (const month of months) total += monthTotal(data, outletId, metric, month);
+  }
+  return store.round(total, 4);
+}
+
+// 年累计（去重口径，对外）：逐月按层级每根子树只取一个排口的计量，再跨月累加
+function accumulatedTons(data, metric, plantId) {
+  const scopeIds = new Set(outletsInScope(data, plantId).map((o) => o.id));
+  const months = Array.from(new Set(
+    data.readings.filter((r) => scopeIds.has(r.outletId)).map((r) => store.monthOf(r.at))
+  )).sort();
+  let total = 0;
+  for (const month of months) {
+    total += hierarchyRollup(data, { month, metric, plantId: plantId || '' }).dedupTotalTons;
   }
   return store.round(total, 4);
 }
@@ -190,13 +203,280 @@ function outletsOf(data, plantId) {
   return data.outlets.filter((o) => o.plantId === plantId);
 }
 
+/* ================= 排放口层级与去重口径 =================
+ * 层级用 outlets.parentId 表达：parentId 为空 = 顶层外排口（总排口/独立排口），
+ * 非空 = 出水汇入上级的车间/过程排口（可多级）。
+ * 去重口径（对外）：一个根子树的同一股水只算一次——顶层外排口当月有计量就以它
+ * 实测为准，其下各级汇入排口一律不累计；顶层无计量时才沿树取第一个有计量的下级
+ * 替代，并在依据里写明；平铺口径（逐口相加，含重复）只保留作对照。 */
+
+function childrenOf(data, outletId) {
+  return data.outlets.filter((o) => o.parentId === outletId).sort((a, b) => (a.code < b.code ? -1 : 1));
+}
+
+// 全部后代 id（广度优先，带成环保护）
+function descendantIds(data, outletId) {
+  const out = [];
+  const seen = new Set([outletId]);
+  let frontier = [outletId];
+  while (frontier.length) {
+    const next = [];
+    for (const pid of frontier) {
+      for (const ch of data.outlets.filter((o) => o.parentId === pid)) {
+        if (seen.has(ch.id)) continue;
+        seen.add(ch.id);
+        out.push(ch.id);
+        next.push(ch.id);
+      }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
+function outletsInScope(data, plantId) {
+  return plantId ? data.outlets.filter((o) => o.plantId === plantId) : data.outlets.slice();
+}
+
+// 顶层排口：parentId 为空，或上级已不在数据/不在本范围（历史脏数据兜底）
+function rootOutlets(data, plantId) {
+  const scope = outletsInScope(data, plantId);
+  const ids = new Set(scope.map((o) => o.id));
+  return scope.filter((o) => !o.parentId || !ids.has(o.parentId))
+    .sort((a, b) => {
+      const pa = plantOf(data, a.plantId);
+      const pb = plantOf(data, b.plantId);
+      const ca = pa ? pa.code : '';
+      const cb = pb ? pb.code : '';
+      if (ca !== cb) return ca < cb ? -1 : 1;
+      return a.code < b.code ? -1 : 1;
+    });
+}
+
+function outletDepth(data, outlet) {
+  let depth = 0;
+  const seen = new Set();
+  let cur = outlet;
+  while (cur && cur.parentId) {
+    if (seen.has(cur.id)) break;
+    seen.add(cur.id);
+    cur = outletOf(data, cur.parentId);
+    depth += 1;
+  }
+  return depth;
+}
+
+function outletPath(data, outlet) {
+  const chain = [];
+  const seen = new Set();
+  let cur = outlet;
+  while (cur) {
+    if (seen.has(cur.id)) break;
+    seen.add(cur.id);
+    chain.unshift(cur.code);
+    cur = cur.parentId ? outletOf(data, cur.parentId) : null;
+  }
+  return chain.join(' / ');
+}
+
+// 当月该指标是否有计量读数（不区分有效标记，只看有没有数据）
+function outletMeasured(data, outletId, metric, month) {
+  return readingsOf(data, { outletId, metric, month }).length > 0;
+}
+
+// 深度优先（同层按编码）找第一个当月有计量的后代
+function firstMeasuredDescendant(data, outletId, metric, month, guard) {
+  const seen = guard || new Set();
+  for (const ch of childrenOf(data, outletId)) {
+    if (seen.has(ch.id)) continue;
+    seen.add(ch.id);
+    if (outletMeasured(data, ch.id, metric, month)) return ch;
+    const deeper = firstMeasuredDescendant(data, ch.id, metric, month, seen);
+    if (deeper) return deeper;
+  }
+  return null;
+}
+
+// 一个根子树去重后取哪一个排口的计量
+function resolveRootOutlet(data, root, metric, month) {
+  if (outletMeasured(data, root.id, metric, month)) {
+    return { resolvedId: root.id, measured: true, basis: '外排口实测' };
+  }
+  const sub = firstMeasuredDescendant(data, root.id, metric, month);
+  if (sub) {
+    return { resolvedId: sub.id, measured: true, basis: '外排口本月无计量，取下级 ' + sub.code + ' 实测替代' };
+  }
+  return { resolvedId: root.id, measured: false, basis: '本月本树无计量，按 0 计' };
+}
+
+// 层级汇总：平铺合计 / 去重合计 / 虚高差额 / 逐口台账 / 逐子树核对
+function hierarchyRollup(data, opts) {
+  const month = opts.month;
+  const metric = opts.metric;
+  const plantId = opts.plantId || '';
+  const scope = outletsInScope(data, plantId);
+  const scopeIds = new Set(scope.map((o) => o.id));
+  const roots = rootOutlets(data, plantId);
+  const ledger = [];
+  const rootCards = [];
+  let flatTotalTons = 0;
+  let dedupTotalTons = 0;
+
+  const pushRow = (o, root, resolve, depth) => {
+    const plant = plantOf(data, o.plantId);
+    const parent = o.parentId ? outletOf(data, o.parentId) : null;
+    const measured = outletMeasured(data, o.id, metric, month);
+    const ownTons = monthTotal(data, o.id, metric, month);
+    const isRoot = o.id === root.id;
+    const hasChildren = descendantIds(data, root.id).length > 0;
+    const counted = o.id === resolve.resolvedId;
+    let role;
+    let basis;
+    if (counted) {
+      if (isRoot) role = hasChildren ? '外排口' : '独立外排口';
+      else role = '替代计量';
+      basis = isRoot && !hasChildren ? (measured ? '独立排放，单独累加（实测）' : '本月无计量，按 0 计') : resolve.basis;
+    } else if (isRoot) {
+      // 顶层外排口本月无计量，已取下级替代
+      role = hasChildren ? '外排口' : '独立外排口';
+      basis = resolve.basis;
+    } else {
+      role = '过程口（汇入上级）';
+      if (resolve.resolvedId === root.id) {
+        basis = parent ? '出水汇入「' + parent.code + '」，已含在上级计量中，不重复计入' : '';
+      } else {
+        const alt = outletOf(data, resolve.resolvedId);
+        basis = '顶层外排口本月无计量，去重口径只取下级「' + (alt ? alt.code : '') + '」替代计入，本口不另计';
+      }
+    }
+    flatTotalTons += ownTons;
+    if (counted) dedupTotalTons += ownTons;
+    ledger.push({
+      id: o.id, code: o.code, name: o.name,
+      plantId: o.plantId, plantCode: plant ? plant.code : '', plantName: plant ? plant.name : '',
+      parentId: o.parentId || '', parentCode: parent ? parent.code : '',
+      type: o.type, status: o.status, depth, path: outletPath(data, o),
+      measured, ownTons, counted, role, basis,
+    });
+    return ownTons;
+  };
+
+  for (const root of roots) {
+    const resolve = resolveRootOutlet(data, root, metric, month);
+    const dropped = [];
+    const walk = (o, depth) => {
+      const ownTons = pushRow(o, root, resolve, depth);
+      if (o.id !== resolve.resolvedId && ownTons > 0) {
+        dropped.push({ id: o.id, code: o.code, name: o.name, tons: ownTons });
+      }
+      childrenOf(data, o.id).filter((ch) => scopeIds.has(ch.id)).forEach((ch) => walk(ch, depth + 1));
+    };
+    walk(root, 0);
+    const subtreeIds = new Set([root.id].concat(descendantIds(data, root.id)).filter((id) => scopeIds.has(id)));
+    const subtreeFlatTons = store.round(ledger.filter((r) => subtreeIds.has(r.id)).reduce((a, r) => a + r.ownTons, 0), 4);
+    const countedTons = store.round(monthTotal(data, resolve.resolvedId, metric, month), 4);
+    const resolvedOutlet = outletOf(data, resolve.resolvedId);
+    rootCards.push({
+      rootId: root.id, rootCode: root.code, rootName: root.name, plantId: root.plantId,
+      resolvedId: resolve.resolvedId,
+      resolvedCode: resolvedOutlet ? resolvedOutlet.code : '',
+      resolvedName: resolvedOutlet ? resolvedOutlet.name : '',
+      resolvedBasis: resolve.basis,
+      subtreeFlatTons,
+      countedTons,
+      duplicatedTons: store.round(subtreeFlatTons - countedTons, 4),
+      dropped,
+    });
+  }
+
+  flatTotalTons = store.round(flatTotalTons, 4);
+  dedupTotalTons = store.round(dedupTotalTons, 4);
+  // 核对：计入行逐口相加 vs 逐子树层级汇总——同一数据源结构性相等，正常差额为 0
+  const detailSumTons = store.round(ledger.filter((r) => r.counted).reduce((a, r) => a + r.ownTons, 0), 4);
+  const hierarchyTotalTons = store.round(rootCards.reduce((a, c) => a + c.countedTons, 0), 4);
+  const flatDetailSumTons = store.round(ledger.reduce((a, r) => a + r.ownTons, 0), 4);
+  const diffTons = store.round(detailSumTons - hierarchyTotalTons, 4);
+  const flatDiffTons = store.round(flatDetailSumTons - flatTotalTons, 4);
+  const diffSources = [];
+  if (diffTons !== 0) diffSources.push('计入行逐口相加（' + detailSumTons + '）与子树汇总（' + hierarchyTotalTons + '）不一致，需检查读数与层级配置');
+  if (flatDiffTons !== 0) diffSources.push('平铺合计与逐口相加差 ' + flatDiffTons + ' 吨');
+
+  return {
+    month, metric, scope: plantId ? 'plant' : 'group', plantId,
+    outletCount: scope.length,
+    countedOutletCount: ledger.filter((r) => r.counted).length,
+    flatTotalTons,
+    dedupTotalTons,
+    duplicatedTons: store.round(flatTotalTons - dedupTotalTons, 4),
+    ledger,
+    roots: rootCards,
+    reconciliation: {
+      detailSumTons,
+      hierarchyTotalTons,
+      diffTons,
+      flatDetailSumTons,
+      flatTotalTons,
+      flatDiffTons,
+      consistent: diffTons === 0 && flatDiffTons === 0,
+      diffSources,
+    },
+  };
+}
+
+// 层级树（结构，供页面树形展示）
+function outletTree(data, plantId) {
+  const scope = outletsInScope(data, plantId);
+  const ids = new Set(scope.map((o) => o.id));
+  const byParent = {};
+  for (const o of scope) {
+    const p = o.parentId && ids.has(o.parentId) ? o.parentId : '';
+    (byParent[p] = byParent[p] || []).push(o);
+  }
+  const build = (pid, depth) => (byParent[pid] || []).sort((a, b) => (a.code < b.code ? -1 : 1)).map((o) => ({
+    id: o.id, code: o.code, name: o.name, plantId: o.plantId,
+    type: o.type, status: o.status,
+    parentId: o.parentId || '', depth, path: outletPath(data, o),
+    childCount: (byParent[o.id] || []).length,
+    children: build(o.id, depth + 1),
+  }));
+  return build('', 0);
+}
+
+// 顺父链找到根子树（带成环保护）
+function rootOfOutlet(data, outlet) {
+  let cur = outlet;
+  const seen = new Set();
+  while (cur && cur.parentId) {
+    if (seen.has(cur.id)) break;
+    seen.add(cur.id);
+    const up = outletOf(data, cur.parentId);
+    if (!up) break;
+    cur = up;
+  }
+  return cur || outlet;
+}
+
 // 排放口汇总：逐指标给出月均、月总量、超标情况
 function outletSummary(data, outletId, month) {
   const outlet = outletOf(data, outletId);
   const settings = data.settings;
   const metrics = ['COD', '氨氮'];
+  const parent = outlet && outlet.parentId ? outletOf(data, outlet.parentId) : null;
+  const depth = outlet ? outletDepth(data, outlet) : 0;
+  const path = outlet ? outletPath(data, outlet) : '';
+  const root = outlet ? rootOfOutlet(data, outlet) : null;
+  const hierarchyByMetric = {};
   const rows = metrics.map((metric) => {
     const ex = exceedance(data, outletId, metric, month);
+    const resolve = root ? resolveRootOutlet(data, root, metric, month) : null;
+    hierarchyByMetric[metric] = resolve ? {
+      rootId: root.id, rootCode: root.code,
+      counted: resolve.resolvedId === outletId,
+      role: resolve.resolvedId === outletId
+        ? (root.id === outletId ? (descendantIds(data, root.id).length ? '外排口' : '独立外排口') : '替代计量')
+        : (root.id === outletId ? (descendantIds(data, root.id).length ? '外排口' : '独立外排口') : '过程口（汇入上级）'),
+      basis: resolve.basis,
+    } : null;
     return {
       metric,
       monthAverage: ex.monthAverage,
@@ -215,6 +495,16 @@ function outletSummary(data, outletId, month) {
     plant: outlet ? plantOf(data, outlet.plantId) : null,
     month,
     rows,
+    hierarchy: {
+      parentId: outlet ? (outlet.parentId || '') : '',
+      parentCode: parent ? parent.code : '',
+      parentName: parent ? parent.name : '',
+      depth,
+      path,
+      rootId: root ? root.id : '',
+      rootCode: root ? root.code : '',
+      byMetric: hierarchyByMetric,
+    },
     devices,
     quarterTotalCod: quarterTotal(data, outletId, 'COD', store.quarterOf(month)),
     permitCodTons: quarterPermitTons(data, 'COD', store.quarterOf(month)),
@@ -228,6 +518,9 @@ function outletSummary(data, outletId, month) {
 module.exports = {
   plantOf, outletOf, deviceOf,
   readingsOf, isCounted, effectiveConcentration, oxygenAt, flowAt,
-  dayRows, dailyStats, dailySeries, monthAverage, monthTotal, quarterTotal, quarterPermitTons, accumulatedTons,
+  dayRows, dailyStats, dailySeries, monthAverage, monthTotal, quarterTotal, quarterPermitTons,
+  accumulatedTons, flatAccumulatedTons,
   exceedance, outletsOf, outletSummary,
+  childrenOf, descendantIds, rootOutlets, outletsInScope, outletDepth, outletPath,
+  outletMeasured, resolveRootOutlet, rootOfOutlet, hierarchyRollup, outletTree,
 };

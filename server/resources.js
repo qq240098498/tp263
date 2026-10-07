@@ -41,11 +41,18 @@ function plantDetail(data, id) {
   if (!plant) throw new AppError(404, 'PLANT_NOT_FOUND', '这个排污单位不存在');
   const outlets = monitor.outletsOf(data, plant.id);
   return Object.assign({}, decoratePlant(data, plant), {
-    outlets: outlets.map((o) => Object.assign({}, o, {
-      devices: data.devices.filter((d) => d.outletId === o.id),
-      deviceCount: data.devices.filter((d) => d.outletId === o.id).length,
-      readingCount: data.readings.filter((r) => r.outletId === o.id).length,
-    })),
+    outlets: outlets.map((o) => {
+      const parent = o.parentId ? monitor.outletOf(data, o.parentId) : null;
+      return Object.assign({}, o, {
+        parentCode: parent ? parent.code : '',
+        parentName: parent ? parent.name : '',
+        depth: monitor.outletDepth(data, o),
+        path: monitor.outletPath(data, o),
+        devices: data.devices.filter((d) => d.outletId === o.id),
+        deviceCount: data.devices.filter((d) => d.outletId === o.id).length,
+        readingCount: data.readings.filter((r) => r.outletId === o.id).length,
+      });
+    }),
     reports: data.reports.filter((r) => r.plantId === plant.id).sort((a, b) => (a.period < b.period ? 1 : -1)),
     findings: (data.findings || []).filter((f) => f.plantId === plant.id),
   });
@@ -110,13 +117,36 @@ function listOutlets(data, query) {
   if (q.status) rows = rows.filter((o) => o.status === q.status);
   return rows.map((o) => {
     const plant = monitor.plantOf(data, o.plantId);
+    const parent = o.parentId ? monitor.outletOf(data, o.parentId) : null;
     return Object.assign({}, o, {
       plantCode: plant ? plant.code : '',
       plantName: plant ? plant.name : '',
+      parentCode: parent ? parent.code : '',
+      parentName: parent ? parent.name : '',
+      depth: monitor.outletDepth(data, o),
+      path: monitor.outletPath(data, o),
+      childCount: monitor.childrenOf(data, o.id).length,
       deviceCount: data.devices.filter((d) => d.outletId === o.id).length,
       readingCount: data.readings.filter((r) => r.outletId === o.id).length,
     });
   }).sort((a, b) => (a.code < b.code ? -1 : 1));
+}
+
+// 校验上级排放口：可空；必须存在、与所属单位相同、不能是自身、不能把自身后代设为上级（防成环）
+function validateOutletParent(data, payload, current) {
+  const merged = Object.assign({}, current || {}, payload || {});
+  const parentId = merged.parentId === undefined || merged.parentId === null ? '' : String(merged.parentId);
+  if (!parentId) return;
+  const parent = data.outlets.find((o) => o.id === parentId);
+  if (!parent) return '上级排放口不存在';
+  const currentId = current ? current.id : '';
+  if (parentId === currentId) return '上级不能选自己';
+  if (currentId && monitor.descendantIds(data, currentId).includes(parentId)) {
+    return '不能把自身的下级设为上级（会形成循环）';
+  }
+  if (currentId && parent.plantId !== merged.plantId) return '上级排放口必须与所属单位相同';
+  if (!currentId && merged.plantId && parent.plantId !== merged.plantId) return '上级排放口必须与所属单位相同';
+  return '';
 }
 
 function validateOutlet(data, payload, current) {
@@ -126,6 +156,8 @@ function validateOutlet(data, payload, current) {
   if (!data.plants.some((p) => p.id === merged.plantId)) errors.plantId = '排污单位不存在';
   if (!OUTLET_TYPE.includes(merged.type)) errors.type = '类型只能是：' + OUTLET_TYPE.join('、');
   if (!OUTLET_STATUS.includes(merged.status)) errors.status = '状态只能是：' + OUTLET_STATUS.join('、');
+  const parentError = validateOutletParent(data, payload, current);
+  if (parentError) errors.parentId = parentError;
   if (Object.keys(errors).length) throw new AppError(400, 'VALIDATION_FAILED', '有几项没通过校验', errors);
 }
 
@@ -136,6 +168,7 @@ function createOutlet(data, payload) {
     code: String(payload.code).trim(),
     name: String(payload.name || '').trim(),
     plantId: payload.plantId,
+    parentId: payload.parentId ? String(payload.parentId) : '',
     type: payload.type,
     status: payload.status,
     remark: String(payload.remark || ''),
@@ -152,6 +185,7 @@ function updateOutlet(data, id, payload) {
   Object.assign(outlet, {
     name: String(merged.name || '').trim(),
     plantId: merged.plantId,
+    parentId: merged.parentId ? String(merged.parentId) : '',
     type: merged.type,
     status: merged.status,
     remark: String(merged.remark || ''),
@@ -162,6 +196,13 @@ function updateOutlet(data, id, payload) {
 function removeOutlet(data, id) {
   const outlet = data.outlets.find((o) => o.id === id);
   if (!outlet) throw new AppError(404, 'OUTLET_NOT_FOUND', '这个排放口不存在');
+  const children = monitor.childrenOf(data, id);
+  if (children.length) {
+    throw new AppError(409, 'OUTLET_HAS_CHILDREN', '下挂 ' + children.length + ' 个子排放口，请先调整或改挂它们的上级', {
+      childCount: children.length,
+      children: children.map((c) => c.code + ' ' + c.name),
+    });
+  }
   const used = data.readings.filter((r) => r.outletId === id).length;
   if (used > 0) throw new AppError(409, 'OUTLET_IN_USE', '这个排放口名下还有 ' + used + ' 条监测数据，不能删除', { count: used });
   data.devices = data.devices.filter((d) => d.outletId !== id);
@@ -330,7 +371,11 @@ function reportDetail(data, id) {
   const plant = monitor.plantOf(data, report.plantId);
   const month = String(report.period).slice(0, 7);
   const outlets = monitor.outletsOf(data, report.plantId).map((o) => monitor.outletSummary(data, o.id, month));
-  return Object.assign({}, report, { plant, month, outlets });
+  const rollup = {};
+  for (const metric of ['COD', '氨氮']) {
+    rollup[metric] = monitor.hierarchyRollup(data, { month, metric, plantId: report.plantId });
+  }
+  return Object.assign({}, report, { plant, month, outlets, rollup });
 }
 
 function createReport(data, payload) {
