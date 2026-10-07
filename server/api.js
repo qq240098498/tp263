@@ -29,6 +29,12 @@ function overview(data) {
   const settings = data.settings;
   const month = currentMonth(data);
   const outletRows = data.outlets.map((o) => monitor.outletSummary(data, o.id, month));
+  // 去重口径：逐排口判定 + 单位/集团合计，供概览表标注与总量核对
+  const reconcile = monitor.groupReconcile(data, month);
+  const outletMarks = {};
+  for (const p of reconcile.plants) {
+    for (const o of p.outlets) outletMarks[o.id] = o;
+  }
   const statusCount = {};
   for (const p of data.plants) statusCount[p.status] = (statusCount[p.status] || 0) + 1;
   const deviceStatus = {};
@@ -49,8 +55,10 @@ function overview(data) {
     reportCount: data.reports.length,
     submittedReportCount: data.reports.filter((r) => r.status === '已上报').length,
     exceededOutletCount: outletRows.filter((s) => s.rows.some((r) => r.exceeded)).length,
-    accumulatedCodTons: monitor.accumulatedTons(data, 'COD'),
-    accumulatedAmmoniaTons: monitor.accumulatedTons(data, '氨氮'),
+    accumulatedCodTons: monitor.accumulatedTonsDedup(data, 'COD'),
+    accumulatedAmmoniaTons: monitor.accumulatedTonsDedup(data, '氨氮'),
+    accumulatedCodTonsFlat: monitor.accumulatedTons(data, 'COD'),
+    accumulatedAmmoniaTonsFlat: monitor.accumulatedTons(data, '氨氮'),
     permitCodTons: Number(settings.annualPermitCodTons),
     permitAmmoniaTons: Number(settings.annualPermitAmmoniaTons),
     settings: {
@@ -64,20 +72,36 @@ function overview(data) {
       annualPermitAmmoniaTons: Number(settings.annualPermitAmmoniaTons),
       tonsDivisor: Number(settings.tonsDivisor),
     },
-    outlets: outletRows.map((s) => ({
-      id: s.outlet.id,
-      code: s.outlet.code,
-      name: s.outlet.name,
-      status: s.outlet.status,
-      type: s.outlet.type,
-      plantCode: s.plant ? s.plant.code : '',
-      plantName: s.plant ? s.plant.name : '',
-      deviceCount: s.devices.length,
-      rows: s.rows,
-      accumulatedCodTons: s.accumulatedCodTons,
-      quarterTotalCod: s.quarterTotalCod,
-      permitCodTons: s.permitCodTons,
-    })),
+    outlets: outletRows.map((s) => {
+      const mark = outletMarks[s.outlet.id] || {};
+      return {
+        id: s.outlet.id,
+        code: s.outlet.code,
+        name: s.outlet.name,
+        status: s.outlet.status,
+        type: s.outlet.type,
+        parentId: s.outlet.parentId || null,
+        depth: mark.depth || 0,
+        isRoot: !!mark.isRoot,
+        parentCode: data.outlets.find((x) => x.id === s.outlet.parentId)
+          ? data.outlets.find((x) => x.id === s.outlet.parentId).code : '',
+        countedCod: !!(mark.counted && mark.counted.COD),
+        countedAmmonia: !!(mark.counted && mark.counted['氨氮']),
+        basisCod: (mark.basis && mark.basis.COD) || 'none',
+        basisAmmonia: (mark.basis && mark.basis['氨氮']) || 'none',
+        plantCode: s.plant ? s.plant.code : '',
+        plantName: s.plant ? s.plant.name : '',
+        deviceCount: s.devices.length,
+        rows: s.rows,
+        accumulatedCodTons: s.accumulatedCodTons,
+        quarterTotalCod: s.quarterTotalCod,
+        permitCodTons: s.permitCodTons,
+      };
+    }),
+    reconcile: {
+      basisRule: reconcile.basisRule,
+      totals: reconcile.totals,
+    },
   };
 }
 
@@ -112,6 +136,15 @@ router.get('/outlets/:id/exceedance', withData((data, req) => {
   const month = req.query.month || currentMonth(data);
   const metrics = req.query.metric ? [req.query.metric] : ['COD', '氨氮'];
   return metrics.map((metric) => monitor.exceedance(data, req.params.id, metric, month));
+}));
+
+router.get('/hierarchy', withData((data) => ({ plants: monitor.hierarchy(data) })));
+router.get('/reconcile', withData((data, req) => {
+  const month = req.query.month || currentMonth(data);
+  const scope = req.query.plantId
+    ? monitor.plantReconcile(data, req.query.plantId, month)
+    : monitor.groupReconcile(data, month);
+  return scope;
 }));
 
 router.get('/devices', withData((data, req) => res.listDevices(data, req.query)));

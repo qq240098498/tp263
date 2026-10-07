@@ -25,6 +25,11 @@ function normalize(raw) {
   for (const key of ['plants', 'outlets', 'devices', 'readings', 'reports']) {
     if (!Array.isArray(data[key])) data[key] = [];
   }
+  // 排放口层级：parentId 指向直接上级（总排口→车间排口，可多级）；没有上级即为独立排口
+  for (const o of data.outlets) {
+    if (o.parentId === undefined) o.parentId = null;
+    if (o.parentId === '') o.parentId = null;
+  }
   return data;
 }
 

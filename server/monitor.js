@@ -190,6 +190,208 @@ function outletsOf(data, plantId) {
   return data.outlets.filter((o) => o.plantId === plantId);
 }
 
+/* ===================== 排放口层级与去重口径 =====================
+   层级：排放口 parentId 指直接上级（总排口下挂车间排口，可多级）；没有上级的是根排口（独立排向环境）。
+   口径（去重，单位级/集团级总量一律按此）：
+   1. 一个层级分支以根排口为计量单元；根排口当月有实测，取根排口实测（其下级车间排口的同股水为重复计量，不计入）；
+   2. 根排口当月缺测时，取其直接下级实测合计；下级也缺测则再向下取，直到取到为止；
+   3. 只有根排口（独立排口）各自独立累加；车间排口不单独累加。
+   平铺口径（仅用于核对展示）：把所有排口实测直接相加，含重复，差额即被去重的车间排口计量。 */
+
+const ROLLUP_METRICS = ['COD', '氨氮'];
+
+function childrenOf(data, outletId) {
+  return data.outlets.filter((o) => o.parentId === outletId);
+}
+function parentOutletOf(data, outletId) {
+  const o = outletOf(data, outletId);
+  return o && o.parentId ? outletOf(data, o.parentId) : null;
+}
+function isRootOutlet(o) { return !o || !o.parentId; }
+
+// 根排口（带成环保护）
+function rootOfOutlet(data, outletId) {
+  let cur = outletOf(data, outletId);
+  const seen = new Set();
+  while (cur && cur.parentId && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    cur = outletOf(data, cur.parentId);
+  }
+  return cur;
+}
+function descendantOutlets(data, outletId) {
+  const out = [];
+  const walk = (id) => {
+    for (const ch of childrenOf(data, id)) { out.push(ch); walk(ch.id); }
+  };
+  walk(outletId);
+  return out;
+}
+
+// 某排口当月某指标是否有有效计量（有有效读数即视为已实测）
+function hasMeasured(data, outletId, metric, month) {
+  const settings = data.settings;
+  return readingsOf(data, { outletId, metric, month })
+    .some((r) => isCounted(r, deviceOf(data, r.deviceId), settings));
+}
+
+// 沿子树取“最高一层有实测”的排口：某节点已实测就不再向下取，避免父子重复
+function measuredBelow(data, outletId, metric, month) {
+  const picked = [];
+  const walk = (o) => {
+    if (hasMeasured(data, o.id, metric, month)) { picked.push(o.id); return; }
+    childrenOf(data, o.id).forEach(walk);
+  };
+  childrenOf(data, outletId).forEach(walk);
+  return picked;
+}
+
+// 一个根排口分支的去重后月总量：本级实测优先，缺测逐级下取
+function countedMonth(data, outletId, metric, month) {
+  if (hasMeasured(data, outletId, metric, month)) {
+    return { value: monthTotal(data, outletId, metric, month), basis: 'measured', measuredOutletIds: [outletId] };
+  }
+  const ids = measuredBelow(data, outletId, metric, month);
+  if (ids.length) {
+    const value = ids.reduce((acc, id) => acc + monthTotal(data, id, metric, month), 0);
+    return { value: store.round(value, 4), basis: 'children', measuredOutletIds: ids };
+  }
+  return { value: 0, basis: 'none', measuredOutletIds: [] };
+}
+
+// 单位层级树（DFS 顺序，depth 从 0 起）
+function outletTreeOfPlant(data, plantId) {
+  const mine = outletsOf(data, plantId);
+  const build = (o, depth) => ({
+    outlet: o, depth,
+    children: childrenOf(data, o.id).filter((c) => c.plantId === plantId).map((c) => build(c, depth + 1)),
+  });
+  const roots = mine.filter((o) => !o.parentId || !mine.some((m) => m.id === o.parentId));
+  return roots.sort((a, b) => (a.code < b.code ? -1 : 1)).map((r) => build(r, 0));
+}
+
+function flattenTree(nodes, out) {
+  out = out || [];
+  for (const n of nodes) {
+    out.push(n);
+    flattenTree(n.children, out);
+  }
+  return out;
+}
+
+// 单个单位的逐排口核对行 + 各口径合计
+function plantReconcile(data, plantId, month) {
+  const plant = plantOf(data, plantId);
+  const flatNodes = flattenTree(outletTreeOfPlant(data, plantId));
+
+  // counted[outletId][metric] = { counted, basis, sourceIds }
+  const marks = {};
+  for (const n of flatNodes) marks[n.outlet.id] = {};
+  for (const n of flatNodes.filter((x) => x.depth === 0)) {
+    for (const metric of ROLLUP_METRICS) {
+      const cm = countedMonth(data, n.outlet.id, metric, month);
+      if (cm.basis === 'measured') {
+        marks[n.outlet.id][metric] = { counted: true, basis: 'measured', sourceIds: [n.outlet.id] };
+      } else if (cm.basis === 'children') {
+        marks[n.outlet.id][metric] = { counted: true, basis: 'children', sourceIds: cm.measuredOutletIds };
+        cm.measuredOutletIds.forEach((id) => {
+          marks[id][metric] = { counted: true, basis: 'fallback', sourceIds: [id] };
+        });
+      } else {
+        marks[n.outlet.id][metric] = { counted: false, basis: 'none', sourceIds: [] };
+      }
+    }
+  }
+
+  const outlets = flatNodes.map((n) => {
+    const o = n.outlet;
+    const node = {
+      id: o.id, code: o.code, name: o.name, type: o.type, status: o.status,
+      parentId: o.parentId, depth: n.depth, isRoot: n.depth === 0,
+      measuredTons: {}, countedTons: {}, counted: {}, basis: {}, sourceOutletIds: {},
+    };
+    for (const metric of ROLLUP_METRICS) {
+      const measured = monthTotal(data, o.id, metric, month);
+      const mark = marks[o.id][metric] || { counted: false, basis: hasMeasured(data, o.id, metric, month) ? 'duplicated' : 'none', sourceIds: [] };
+      // 有实测但没被计入的车间排口，即重复计量
+      if (!mark.counted && hasMeasured(data, o.id, metric, month)) mark.basis = 'duplicated';
+      node.measuredTons[metric] = measured;
+      node.countedTons[metric] = mark.counted ? measured : 0;
+      node.counted[metric] = !!mark.counted;
+      node.basis[metric] = mark.basis;
+      node.sourceOutletIds[metric] = mark.sourceIds || [];
+    }
+    return node;
+  });
+
+  const rows = {};
+  for (const metric of ROLLUP_METRICS) {
+    const flatTotal = store.round(outlets.reduce((a, x) => a + x.measuredTons[metric], 0), 4);
+    const roots = outlets.filter((x) => x.isRoot);
+    const dedup = store.round(roots.reduce((a, r) => a + countedMonth(data, r.id, metric, month).value, 0), 4);
+    const countedDetailTotal = store.round(outlets.reduce((a, x) => a + x.countedTons[metric], 0), 4);
+    rows[metric] = {
+      metric,
+      flatTotalTons: flatTotal,
+      deduplicatedTotalTons: dedup,
+      doubleCountedTons: store.round(flatTotal - dedup, 4),
+      countedDetailTons: countedDetailTotal,
+      matched: store.round(countedDetailTotal - dedup, 4) === 0,
+    };
+  }
+
+  return { plant: plant ? { id: plant.id, code: plant.code, name: plant.name, status: plant.status } : null, month, outlets, rows };
+}
+
+// 集团级核对：单位汇总相加，给出口径对照与差额
+function groupReconcile(data, month) {
+  const plants = data.plants
+    .map((p) => plantReconcile(data, p.id, month))
+    .sort((a, b) => ((a.plant && a.plant.code) < (b.plant && b.plant.code) ? -1 : 1));
+  const totals = {};
+  for (const metric of ROLLUP_METRICS) {
+    const flat = store.round(plants.reduce((a, p) => a + p.rows[metric].flatTotalTons, 0), 4);
+    const dedup = store.round(plants.reduce((a, p) => a + p.rows[metric].deduplicatedTotalTons, 0), 4);
+    const countedDetail = store.round(plants.reduce((a, p) => a + p.rows[metric].countedDetailTons, 0), 4);
+    totals[metric] = {
+      metric,
+      flatTotalTons: flat,
+      deduplicatedTotalTons: dedup,
+      doubleCountedTons: store.round(flat - dedup, 4),
+      countedDetailTons: countedDetail,
+      matched: store.round(countedDetail - dedup, 4) === 0,
+    };
+  }
+  return {
+    month,
+    metrics: ROLLUP_METRICS,
+    basisRule: '以排向环境的总排口（无上级的根排口）实测为准；总排口当月缺测时取直接下级实测合计、逐级下取；车间排口同股水已在总排口计量，不单独累加；只有独立排口各自累加。',
+    plants,
+    totals,
+  };
+}
+
+// 全部层级树（供层级接口/页面使用）
+function hierarchy(data) {
+  return data.plants
+    .slice()
+    .sort((a, b) => (a.code < b.code ? -1 : 1))
+    .map((p) => ({ plant: { id: p.id, code: p.code, name: p.name, status: p.status }, tree: outletTreeOfPlant(data, p.id) }));
+}
+
+// 年累计（去重口径）：逐单位逐月按层级口径合计后相加
+function accumulatedTonsDedup(data, metric) {
+  const months = Array.from(new Set(data.readings.map((r) => store.monthOf(r.at)))).sort();
+  let total = 0;
+  for (const p of data.plants) {
+    for (const month of months) {
+      const roots = outletsOf(data, p.id).filter((o) => !o.parentId);
+      for (const r of roots) total += countedMonth(data, r.id, metric, month).value;
+    }
+  }
+  return store.round(total, 4);
+}
+
 // 排放口汇总：逐指标给出月均、月总量、超标情况
 function outletSummary(data, outletId, month) {
   const outlet = outletOf(data, outletId);
@@ -219,8 +421,10 @@ function outletSummary(data, outletId, month) {
     quarterTotalCod: quarterTotal(data, outletId, 'COD', store.quarterOf(month)),
     permitCodTons: quarterPermitTons(data, 'COD', store.quarterOf(month)),
     annualPermitCodTons: Number(settings.annualPermitCodTons),
-    accumulatedCodTons: accumulatedTons(data, 'COD'),
-    accumulatedAmmoniaTons: accumulatedTons(data, '氨氮'),
+    accumulatedCodTons: accumulatedTonsDedup(data, 'COD'),
+    accumulatedAmmoniaTons: accumulatedTonsDedup(data, '氨氮'),
+    accumulatedCodTonsFlat: accumulatedTons(data, 'COD'),
+    accumulatedAmmoniaTonsFlat: accumulatedTons(data, '氨氮'),
     settings,
   };
 }
@@ -230,4 +434,7 @@ module.exports = {
   readingsOf, isCounted, effectiveConcentration, oxygenAt, flowAt,
   dayRows, dailyStats, dailySeries, monthAverage, monthTotal, quarterTotal, quarterPermitTons, accumulatedTons,
   exceedance, outletsOf, outletSummary,
+  childrenOf, parentOutletOf, isRootOutlet, rootOfOutlet, descendantOutlets,
+  outletTreeOfPlant, flattenTree, countedMonth, plantReconcile, groupReconcile, hierarchy,
+  accumulatedTonsDedup, ROLLUP_METRICS,
 };

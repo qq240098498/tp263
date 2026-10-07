@@ -110,13 +110,35 @@ function listOutlets(data, query) {
   if (q.status) rows = rows.filter((o) => o.status === q.status);
   return rows.map((o) => {
     const plant = monitor.plantOf(data, o.plantId);
+    const parent = monitor.parentOutletOf(data, o.id);
     return Object.assign({}, o, {
       plantCode: plant ? plant.code : '',
       plantName: plant ? plant.name : '',
+      parentCode: parent ? parent.code : '',
+      parentName: parent ? parent.name : '',
+      isRoot: monitor.isRootOutlet(o),
+      childrenCount: monitor.childrenOf(data, o.id).length,
       deviceCount: data.devices.filter((d) => d.outletId === o.id).length,
       readingCount: data.readings.filter((r) => r.outletId === o.id).length,
     });
   }).sort((a, b) => (a.code < b.code ? -1 : 1));
+}
+
+// 校验上级排口：必须存在、与本排口同一排污单位、不能选自己、不能形成环
+function validateParent(data, payload, merged, errors, selfId) {
+  if (merged.parentId === undefined || merged.parentId === null || merged.parentId === '') {
+    merged.parentId = null;
+    return;
+  }
+  merged.parentId = String(merged.parentId);
+  const parent = data.outlets.find((o) => o.id === merged.parentId);
+  if (!parent) { errors.parentId = '上级排放口不存在'; return; }
+  if (parent.id === selfId) { errors.parentId = '上级排放口不能选它自己'; return; }
+  if (parent.plantId !== merged.plantId) { errors.parentId = '上级排放口必须属于同一排污单位'; return; }
+  if (selfId) {
+    const root = monitor.rootOfOutlet(data, merged.parentId);
+    if (root && root.id === selfId) errors.parentId = '这样挂会形成上下级环路';
+  }
 }
 
 function validateOutlet(data, payload, current) {
@@ -126,19 +148,22 @@ function validateOutlet(data, payload, current) {
   if (!data.plants.some((p) => p.id === merged.plantId)) errors.plantId = '排污单位不存在';
   if (!OUTLET_TYPE.includes(merged.type)) errors.type = '类型只能是：' + OUTLET_TYPE.join('、');
   if (!OUTLET_STATUS.includes(merged.status)) errors.status = '状态只能是：' + OUTLET_STATUS.join('、');
+  validateParent(data, payload, merged, errors, current ? current.id : null);
   if (Object.keys(errors).length) throw new AppError(400, 'VALIDATION_FAILED', '有几项没通过校验', errors);
+  return merged;
 }
 
 function createOutlet(data, payload) {
-  validateOutlet(data, payload, null);
+  const merged = validateOutlet(data, payload, null);
   const outlet = {
     id: store.nextId('ol', data.outlets),
-    code: String(payload.code).trim(),
-    name: String(payload.name || '').trim(),
-    plantId: payload.plantId,
-    type: payload.type,
-    status: payload.status,
-    remark: String(payload.remark || ''),
+    code: String(merged.code).trim(),
+    name: String(merged.name || '').trim(),
+    plantId: merged.plantId,
+    parentId: merged.parentId || null,
+    type: merged.type,
+    status: merged.status,
+    remark: String(merged.remark || ''),
   };
   data.outlets.push(outlet);
   return outlet;
@@ -147,14 +172,14 @@ function createOutlet(data, payload) {
 function updateOutlet(data, id, payload) {
   const outlet = data.outlets.find((o) => o.id === id);
   if (!outlet) throw new AppError(404, 'OUTLET_NOT_FOUND', '这个排放口不存在');
-  validateOutlet(data, payload, outlet);
-  const merged = Object.assign({}, outlet, payload);
+  const merged = validateOutlet(data, payload, outlet);
   Object.assign(outlet, {
     name: String(merged.name || '').trim(),
     plantId: merged.plantId,
+    parentId: merged.parentId || null,
     type: merged.type,
     status: merged.status,
-    remark: String(merged.remark || ''),
+    remark: String(merged.remark || '').trim(),
   });
   return outlet;
 }
@@ -162,13 +187,16 @@ function updateOutlet(data, id, payload) {
 function removeOutlet(data, id) {
   const outlet = data.outlets.find((o) => o.id === id);
   if (!outlet) throw new AppError(404, 'OUTLET_NOT_FOUND', '这个排放口不存在');
+  const children = monitor.childrenOf(data, id);
+  if (children.length) {
+    throw new AppError(409, 'OUTLET_HAS_CHILDREN', '下挂着 ' + children.length + ' 个下级排口，请先改挂或删除下级', { count: children.length });
+  }
   const used = data.readings.filter((r) => r.outletId === id).length;
   if (used > 0) throw new AppError(409, 'OUTLET_IN_USE', '这个排放口名下还有 ' + used + ' 条监测数据，不能删除', { count: used });
   data.devices = data.devices.filter((d) => d.outletId !== id);
   data.outlets = data.outlets.filter((o) => o.id !== id);
   return { removed: id };
 }
-
 function listDevices(data, query) {
   const q = query || {};
   let rows = data.devices.slice();
@@ -330,7 +358,7 @@ function reportDetail(data, id) {
   const plant = monitor.plantOf(data, report.plantId);
   const month = String(report.period).slice(0, 7);
   const outlets = monitor.outletsOf(data, report.plantId).map((o) => monitor.outletSummary(data, o.id, month));
-  return Object.assign({}, report, { plant, month, outlets });
+  return Object.assign({}, report, { plant, month, outlets, reconcile: monitor.plantReconcile(data, report.plantId, month) });
 }
 
 function createReport(data, payload) {

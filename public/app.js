@@ -346,7 +346,51 @@
     else if (view === 'plants') renderPlants();
     else if (view === 'devices') renderDevices();
     else if (view === 'readings') renderReadings();
+    else if (view === 'reconcile') renderReconcile();
     else if (view === 'accounting') renderAccounting();
+  }
+
+  function basisLabel(basis) {
+    switch (basis) {
+      case 'measured': return '计入·本口实测';
+      case 'children': return '计入·下级合计';
+      case 'fallback': return '计入·上级缺测下取';
+      case 'duplicated': return '重复计量·不计入';
+      default: return '当月无有效数据';
+    }
+  }
+  function basisTag(basis) {
+    if (basis === 'none' || !basis) return h('span', { class: 'sub', text: '—' });
+    var cls = basis === 'measured' ? 'tag-ok' : basis === 'duplicated' ? 'tag-danger' : 'tag-warn';
+    return h('span', { class: 'tag ' + cls + ' tag-mini', text: basisLabel(basis), title: basisLabel(basis) });
+  }
+  function depthPrefix(depth) {
+    var s = '';
+    for (var i = 0; i < depth; i += 1) s += (i === depth - 1 ? '└ ' : '　 ');
+    return s;
+  }
+  // 平铺排放口列表 -> 按单位/父子关系排好的树顺序（父被筛掉时作为根兜底）
+  function outletsInTreeOrder(list) {
+    var byParent = {};
+    list.forEach(function (o) {
+      var key = o.parentId || '';
+      (byParent[key] = byParent[key] || []).push(o);
+    });
+    Object.keys(byParent).forEach(function (k) {
+      byParent[k].sort(function (a, b) { return (a.code < b.code ? -1 : 1); });
+    });
+    var out = [];
+    var walk = function (o, depth) {
+      out.push({ o: o, depth: depth });
+      (byParent[o.id] || []).forEach(function (c) { walk(c, depth + 1); });
+    };
+    var roots = list.filter(function (o) { return !o.parentId || !list.some(function (x) { return x.id === o.parentId; }); });
+    roots.sort(function (a, b) { return ((a.plantCode || '') + a.code) < ((b.plantCode || '') + b.code) ? -1 : 1; });
+    roots.forEach(function (r) { walk(r, 0); });
+    list.forEach(function (o) {
+      if (!out.some(function (x) { return x.o.id === o.id; })) out.push({ o: o, depth: 0 });
+    });
+    return out;
   }
 
   /* ================= 概览 ================= */
@@ -365,7 +409,7 @@
     var f = clear(document.getElementById('filters-overview'));
     f.appendChild(h('div', { class: 'filter-box' }, [
       h('div', { class: 'filter-title', text: '概览' }),
-      h('p', { class: 'hint', text: '本页所有数字均直接取 /api/summary 的返回字段，前端不做计算。' })
+      h('p', { class: 'hint', text: '本页年累计与本月总量均为去重口径，直接取 /api/summary 返回字段，前端不做计算。' })
     ]));
 
     var c = clear(document.getElementById('content-overview'));
@@ -377,32 +421,32 @@
 
     c.appendChild(h('div', { class: 'metric-grid' }, [
       metricCard('排污单位', s.plantCount, '生产中 ' + s.producingCount + ' 家', 'plants'),
-      metricCard('排放口', s.outletCount, '运行中 ' + s.runningOutletCount + ' 个', 'plants'),
+      metricCard('排放口', s.outletCount, '运行中 ' + s.runningOutletCount + ' 个（含下级车间排口）', 'plants'),
       metricCard('在线设备', s.deviceCount, dsText, 'devices'),
       metricCard('监测数据', s.readingCount, '自动 ' + s.autoCount + ' · 补录 ' + s.imputedCount + ' · 无效标记 ' + s.invalidFlagCount, 'readings'),
       metricCard('报表', s.reportCount, '已上报 ' + s.submittedReportCount + ' 张', 'accounting'),
-      metricCard('超标排放口', s.exceededOutletCount, '存在月超标判定', 'accounting'),
-      metricCard('年累计 COD', s.accumulatedCodTons + ' 吨', '年许可量 ' + s.permitCodTons + ' 吨', 'accounting'),
-      metricCard('年累计氨氮', s.accumulatedAmmoniaTons + ' 吨', '年许可量 ' + s.permitAmmoniaTons + ' 吨', 'accounting')
+      metricCard('超标排放口', s.exceededOutletCount, '存在月超标判定', 'reconcile'),
+      metricCard('年累计 COD（去重）', s.accumulatedCodTons + ' 吨', '平铺合计 ' + s.accumulatedCodTonsFlat + ' · 年许可 ' + s.permitCodTons + ' 吨', 'reconcile'),
+      metricCard('年累计氨氮（去重）', s.accumulatedAmmoniaTons + ' 吨', '平铺合计 ' + s.accumulatedAmmoniaTonsFlat + ' · 年许可 ' + s.permitAmmoniaTons + ' 吨', 'reconcile')
     ]));
 
     var tb = h('tbody');
-    (s.outlets || []).forEach(function (o) {
+    outletsInTreeOrder(s.outlets || []).forEach(function (x) {
+      var o = x.o;
       var cod = metricOf(o.rows, 'COD');
       var amm = metricOf(o.rows, '氨氮');
       var tr = h('tr', { class: 'row', title: '点此行到「核算与报表」查看该排放口' }, [
-        h('td', {}, [h('b', { text: o.code }), ' ', o.name]),
+        h('td', {}, [h('span', { class: 'muted', text: depthPrefix(o.depth || 0) }), h('b', { text: o.code }), ' ', o.name,
+          o.isRoot ? '' : h('span', { class: 'tag tag-warn tag-mini', text: '下级' })]),
         h('td', { text: textOf(o.plantName) }),
         h('td', { text: textOf(o.type) }),
         h('td', {}, statusTag(o.status, '运行')),
-        h('td', { class: 'mono', text: fmt(cod.monthAverage) }),
         h('td', { class: 'mono', text: fmt(cod.monthTotalTons, 4) }),
-        h('td', { class: 'mono' + (Number(cod.exceedDaysCount) > 0 ? ' num-danger' : ''), text: textOf(cod.exceedDaysCount) }),
-        h('td', { class: 'mono', text: textOf(cod.exceedHours) }),
-        h('td', { class: 'mono', text: fmt(amm.monthAverage) }),
+        h('td', {}, basisTag(o.basisCod)),
         h('td', { class: 'mono', text: fmt(amm.monthTotalTons, 4) }),
-        h('td', { class: 'mono' + (Number(amm.exceedDaysCount) > 0 ? ' num-danger' : ''), text: textOf(amm.exceedDaysCount) }),
-        h('td', { class: 'mono', text: textOf(amm.exceedHours) })
+        h('td', {}, basisTag(o.basisAmmonia)),
+        h('td', { class: 'mono' + (Number(cod.exceedDaysCount) > 0 ? ' num-danger' : ''), text: textOf(cod.exceedDaysCount) }),
+        h('td', { class: 'mono' + (Number(amm.exceedDaysCount) > 0 ? ' num-danger' : ''), text: textOf(amm.exceedDaysCount) })
       ]);
       tr.addEventListener('click', function () {
         state.accounting.outletId = o.id;
@@ -414,17 +458,24 @@
 
     var table = h('table', { id: 'tableOverviewOutlet' }, [
       h('thead', {}, h('tr', {}, [
-        h('th', { text: '排放口' }), h('th', { text: '所属单位' }), h('th', { text: '类型' }), h('th', { text: '状态' }),
-        h('th', { text: 'COD 月均' }), h('th', { text: 'COD 月总量(吨)' }), h('th', { text: 'COD 超标天数' }), h('th', { text: 'COD 超标小时' }),
-        h('th', { text: '氨氮 月均' }), h('th', { text: '氨氮 月总量(吨)' }), h('th', { text: '氨氮 超标天数' }), h('th', { text: '氨氮 超标小时' })
+        h('th', { text: '排放口（层级）' }), h('th', { text: '所属单位' }), h('th', { text: '类型' }), h('th', { text: '状态' }),
+        h('th', { text: 'COD 月总量(吨)' }), h('th', { text: 'COD 计入判定' }),
+        h('th', { text: '氨氮 月总量(吨)' }), h('th', { text: '氨氮 计入判定' }),
+        h('th', { text: 'COD 超标天数' }), h('th', { text: '氨氮 超标天数' })
       ])),
       tb
     ]);
 
+    var t = s.reconcile && s.reconcile.totals ? s.reconcile.totals : null;
+    var sub = '月份 ' + s.month + ' · 去重口径：总排口实测优先、缺测逐级下取，车间排口同股水不重复累加';
+    if (t) {
+      sub += '（集团平铺 COD ' + t.COD.flatTotalTons + '→去重 ' + t.COD.deduplicatedTotalTons +
+        ' 吨；氨氮 ' + t['氨氮'].flatTotalTons + '→' + t['氨氮'].deduplicatedTotalTons + ' 吨，可在「层级核对」逐口核对）';
+    }
     c.appendChild(h('div', { class: 'card' }, [
       h('div', { class: 'card-head' }, [
         h('h2', { text: '本月各排放口 COD / 氨氮 情况' }),
-        h('span', { class: 'sub', text: '月份 ' + s.month + '（点行跳到核算页并选中该排放口）' })
+        h('span', { class: 'sub', text: sub })
       ]),
       h('div', { class: 'table-wrap' }, table)
     ]));
@@ -439,15 +490,17 @@
       if (!d.outlets || !d.outlets.length) og.appendChild(h('div', { class: 'empty', text: '暂无排放口' }));
       else {
         var tb = h('tbody');
-        d.outlets.forEach(function (o) {
+        outletsInTreeOrder(d.outlets).forEach(function (x) {
+          var o = x.o;
           tb.appendChild(h('tr', { class: 'row' }, [
-            h('td', { text: o.code }), h('td', { text: o.name }), h('td', { text: o.type }),
+            h('td', {}, [h('span', { class: 'muted', text: depthPrefix(x.depth) }), h('b', { text: o.code })]),
+            h('td', { text: o.name }), h('td', { text: o.type }),
             h('td', {}, statusTag(o.status, '运行')),
             h('td', { class: 'mono', text: textOf(o.deviceCount) }), h('td', { class: 'mono', text: textOf(o.readingCount) })
           ]));
         });
         og.appendChild(h('table', {}, [h('thead', {}, h('tr', {}, [
-          h('th', { text: '编码' }), h('th', { text: '名称' }), h('th', { text: '类型' }), h('th', { text: '状态' }),
+          h('th', { text: '编码（层级）' }), h('th', { text: '名称' }), h('th', { text: '类型' }), h('th', { text: '状态' }),
           h('th', { text: '设备数' }), h('th', { text: '数据条数' })
         ])), tb]));
       }
@@ -494,7 +547,8 @@
     ], function () { return plantDetailNode(p.id); });
   }
 
-  function outletRow(o) {
+  function outletRow(o, depth) {
+    depth = depth || 0;
     var actions = actionsCell([
       actionBtn('修改', function () { openOutletForm(o); }),
       deleteBtn('删除', function () {
@@ -502,9 +556,12 @@
       })
     ]);
     return expandableRow([
-      h('td', {}, h('b', { text: o.code })),
+      h('td', {}, [h('span', { class: 'muted', text: depthPrefix(depth) }), h('b', { text: o.code })]),
       h('td', { text: textOf(o.name) }),
       h('td', { text: textOf(o.plantCode + ' ' + o.plantName).trim() || '—' }),
+      h('td', {}, o.parentId
+        ? h('span', { class: 'sub', text: '└ ' + textOf(o.parentCode) })
+        : h('span', { class: 'tag tag-ok tag-mini', text: '独立 / 总排口' })),
       h('td', { text: textOf(o.type) }),
       h('td', {}, statusTag(o.status, '运行')),
       h('td', { class: 'mono', text: textOf(o.deviceCount) }),
@@ -512,10 +569,13 @@
       actions
     ], function () {
       var box = h('div', { class: 'detail-grid' });
-      box.appendChild(h('div', { class: 'detail-block' }, [
-        h('h3', { text: '备注' }),
-        h('div', { text: textOf(o.remark) })
-      ]));
+      var info = h('div', { class: 'detail-block' });
+      info.appendChild(h('h3', { text: '层级与备注' }));
+      info.appendChild(h('div', { class: 'section-note' }, o.parentId
+        ? ['上级排口：', h('b', { text: textOf(o.parentCode + ' ' + o.parentName) }), '（出水汇入上级，同股水在上级计量）']
+        : '无上级排口，属独立排向环境的总排口；下挂下级 ' + textOf(o.childrenCount) + ' 个。'));
+      info.appendChild(h('div', { text: textOf(o.remark) }));
+      box.appendChild(info);
       var devs = state.devices.filter(function (d) { return d.outletId === o.id; });
       var db = h('div', { class: 'detail-block' });
       db.appendChild(h('h3', { text: '设备（' + devs.length + '）' }));
@@ -588,19 +648,20 @@
     ]));
 
     var outletTb = h('tbody');
-    outletsRes.forEach(function (o) { outletTb.appendChild(outletRow(o)); });
+    outletsInTreeOrder(outletsRes).forEach(function (x) { outletTb.appendChild(outletRow(x.o, x.depth)); });
     var outletTable = h('table', { id: 'tableOutlets' }, [
       h('thead', {}, h('tr', {}, [
-        h('th', { text: '编码' }), h('th', { text: '名称' }), h('th', { text: '所属单位' }), h('th', { text: '类型' }),
+        h('th', { text: '编码' }), h('th', { text: '名称' }), h('th', { text: '所属单位' }), h('th', { text: '上级排口' }),
+        h('th', { text: '类型' }),
         h('th', { text: '状态' }), h('th', { text: '设备数' }), h('th', { text: '数据条数' }), h('th', { text: '操作' })
       ])),
       outletTb
     ]);
     c.appendChild(h('div', { class: 'card' }, [
       h('div', { class: 'card-head' }, [
-        h('h2', { text: '排放口台账' }),
+        h('h2', { text: '排放口台账（层级）' }),
         h('div', { class: 'btn-row' }, [
-          h('span', { class: 'sub', text: '共 ' + outletsRes.length + ' 个' }),
+          h('span', { class: 'sub', text: '共 ' + outletsRes.length + ' 个，按单位层级展示；└ 为下级（车间）排口，无上级的为独立总排口' }),
           h('button', { type: 'button', class: 'btn btn-sm btn-accent', text: '新增排放口', onclick: function () { openOutletForm(null); } })
         ])
       ]),
@@ -635,11 +696,29 @@
       { name: 'code', label: '编码' },
       { name: 'name', label: '名称' },
       { name: 'plantId', label: '所属单位', type: 'select', options: state.plants.map(function (p) { return { value: p.id, label: p.code + ' ' + p.name }; }) },
+      { name: 'parentId', label: '上级排口（不选 = 独立总排口）', type: 'select', options: [] },
       { name: 'type', label: '类型', type: 'select', options: OUTLET_TYPE },
       { name: 'status', label: '状态', type: 'select', options: OUTLET_STATUS },
       { name: 'remark', label: '备注', full: true }
     ];
-    var form = buildForm(fields, outlet || { type: '主要排放口', status: '运行', plantId: state.plants.length ? state.plants[0].id : '' });
+    var form = buildForm(fields, outlet || { type: '主要排放口', status: '运行', plantId: state.plants.length ? state.plants[0].id : '', parentId: '' });
+    var plantSel = form.querySelector('[data-field="plantId"]');
+    var parentSel = form.querySelector('[data-field="parentId"]');
+    function refillParents() {
+      var cur = parentSel.value;
+      parentSel.innerHTML = '';
+      parentSel.appendChild(h('option', { value: '', text: '无（独立排口 / 总排口）' }));
+      state.outlets
+        .filter(function (o) { return o.plantId === plantSel.value && (!outlet || o.id !== outlet.id); })
+        .forEach(function (o) {
+          var prefix = o.parentId ? '　' : '';
+          parentSel.appendChild(h('option', { value: o.id, text: prefix + o.code + ' ' + o.name }));
+        });
+      parentSel.value = cur || '';
+    }
+    plantSel.addEventListener('change', refillParents);
+    refillParents();
+    if (outlet) parentSel.value = outlet.parentId || '';
     var save = h('button', { type: 'button', class: 'btn btn-accent', text: '保存' });
     save.addEventListener('click', function () {
       var payload = collectForm(form);
@@ -1126,6 +1205,15 @@
       sum = out[0]; daily = out[1];
     } catch (e) { showError(e); c.appendChild(h('div', { class: 'empty', text: '加载失败：' + e.message })); return; }
 
+    var acOutlet = state.outlets.filter(function (o) { return o.id === state.accounting.outletId; })[0];
+    if (acOutlet && acOutlet.parentId) {
+      c.appendChild(h('div', { class: 'card notice-card' }, [
+        h('div', { class: 'card-body' }, h('div', { class: 'section-note' }, [
+          h('b', { text: '层级口径提示：' }),
+          '本排口是「' + acOutlet.parentCode + ' ' + acOutlet.parentName + '」的下级排口，出水汇入上级、同股水在总排口已计量。单位/集团总量按总排口实测计入、本排口不重复累加（仅当总排口缺测时才取本排口等下级合计下取）。本页数字是本排口自身的过程监测值，去重后的总量请到「层级核对」查看。'
+        ]))
+      ]));
+    }
     c.appendChild(h('div', { class: 'card' }, [
       h('div', { class: 'card-head' }, [
         h('h2', { text: (sum.outlet ? (sum.outlet.code + ' ' + sum.outlet.name) : '排放口') + ' 汇总' }),
@@ -1169,6 +1257,157 @@
         reportTb
       ]))
     ]));
+  }
+
+  /* ================= 层级核对 ================= */
+  var reconcileState = { month: '', data: null };
+
+  function reconcileTotalsTable(totals) {
+    var order = ['COD', '氨氮'];
+    var tb = h('tbody');
+    order.forEach(function (mt) {
+      var t = totals[mt];
+      tb.appendChild(h('tr', {}, [
+        h('td', {}, h('b', { text: mt })),
+        h('td', { class: 'mono', text: fmt(t.flatTotalTons, 4) }),
+        h('td', { class: 'mono num-ok', text: fmt(t.deduplicatedTotalTons, 4) }),
+        h('td', { class: 'mono num-danger', text: fmt(t.doubleCountedTons, 4) }),
+        h('td', { class: 'mono', text: fmt(t.countedDetailTons, 4) }),
+        h('td', {}, t.matched
+          ? h('span', { class: 'tag tag-ok', text: '一致 · 差额 0' })
+          : h('span', { class: 'tag tag-danger', text: '差额 ' + fmt(t.countedDetailTons - t.deduplicatedTotalTons, 4) }))
+      ]));
+    });
+    return h('table', { class: 'mini-table' }, [
+      h('thead', {}, h('tr', {}, [
+        h('th', { text: '指标' }), h('th', { text: '平铺合计（含重复）' }), h('th', { text: '去重后合计（法定口径）' }),
+        h('th', { text: '重复差额' }), h('th', { text: '逐排口明细相加' }), h('th', { text: '核对结果' })
+      ])),
+      tb
+    ]);
+  }
+
+  function reconcileJudgeTag(o, mt) {
+    var map = {
+      measured: ['tag-ok', '计入', '计入总量：以本口（独立总排口）实测为准'],
+      children: ['tag-warn', '下级合计', '本口当月缺测，计入其下级实测合计（逐级下取）'],
+      fallback: ['tag-warn', '下取计入', '上级总排口缺测，本口实测被上取计入该分支总量'],
+      duplicated: ['tag-danger', '重复不计', '同股水已在上级总排口计量，按总排口口径只计一次，本口扣减'],
+      none: ['tag-muted', '无数据', '当月没有有效计量数据']
+    };
+    var m = map[o.basis[mt]] || map.none;
+    return h('span', { class: 'tag ' + m[0] + ' tag-mini', text: m[1], title: m[2] });
+  }
+
+  function reconcileOutletTable(pr) {
+    var codeById = {};
+    (pr.outlets || []).forEach(function (o) { codeById[o.id] = o.code; });
+    var tb = h('tbody');
+    pr.outlets.forEach(function (o) {
+      var childTitle = function (mt) {
+        var ids = (o.sourceOutletIds[mt] || []).map(function (id) { return codeById[id] || id; });
+        return ids.length ? ('取下级排口：' + ids.join('、')) : '';
+      };
+      var codTag = reconcileJudgeTag(o, 'COD');
+      if (o.basis.COD === 'children') codTag.title = '计入下级实测合计：' + childTitle('COD');
+      var ammTag = reconcileJudgeTag(o, '氨氮');
+      if (o.basis['氨氮'] === 'children') ammTag.title = '计入下级实测合计：' + childTitle('氨氮');
+      tb.appendChild(h('tr', { class: 'row' + (o.depth ? ' row-child' : '') }, [
+        h('td', {}, [h('span', { class: 'muted', text: depthPrefix(o.depth) }), h('b', { text: o.code }), ' ', o.name]),
+        h('td', { text: textOf(o.type) }),
+        h('td', {}, statusTag(o.status, '运行')),
+        h('td', { class: 'mono', text: fmt(o.measuredTons.COD, 4) }),
+        h('td', {}, codTag),
+        h('td', { class: 'mono', text: fmt(o.measuredTons['氨氮'], 4) }),
+        h('td', {}, ammTag)
+      ]));
+    });
+    return h('table', { class: 'mini-table' }, [
+      h('thead', {}, h('tr', {}, [
+        h('th', { text: '排放口（层级）' }), h('th', { text: '类型' }), h('th', { text: '状态' }),
+        h('th', { text: 'COD 实测(吨)' }), h('th', { text: 'COD 判定' }),
+        h('th', { text: '氨氮 实测(吨)' }), h('th', { text: '氨氮 判定' })
+      ])),
+      tb
+    ]);
+  }
+
+  function diffSourceNote(pr, mt) {
+    var t = pr.rows[mt];
+    var dups = (pr.outlets || []).filter(function (o) { return o.basis[mt] === 'duplicated'; });
+    var falls = (pr.outlets || []).filter(function (o) { return o.basis[mt] === 'fallback'; });
+    var nodes = [
+      h('div', {}, [
+        h('b', { text: mt + '　' }),
+        '平铺 ', fmt(t.flatTotalTons, 4), ' → 去重 ', fmt(t.deduplicatedTotalTons, 4), ' 吨；重复差额 ',
+        h('b', { class: t.doubleCountedTons ? 'num-danger' : 'num-ok', text: fmt(t.doubleCountedTons, 4) }), ' 吨'
+      ])
+    ];
+    if (dups.length) {
+      nodes.push(h('div', { class: 'hint', text: '差额来自车间排口同股水重复计量：' +
+        dups.map(function (o) { return o.code + ' ' + o.name; }).join('、') +
+        '（总排口已计量，按总排口口径只计一次，故扣减其 ' + fmt(t.doubleCountedTons, 4) + ' 吨）。' }));
+    }
+    if (falls.length) {
+      nodes.push(h('div', { class: 'hint', text: '上级缺测下取：' +
+        falls.map(function (o) { return o.code + ' ' + o.name; }).join('、') +
+        '（其总排口当月无有效计量，按下级实测合计计入，不与其他排口重复）。' }));
+    }
+    if (!dups.length && !falls.length) nodes.push(h('div', { class: 'hint', text: '本月无层级重叠计量，平铺与去重相等。' }));
+    nodes.push(h('div', { class: 'hint' }, [
+      t.matched ? h('span', { class: 'num-ok', text: '逐排口明细相加 ' + fmt(t.countedDetailTons, 4) + ' = 去重后合计，核对一致。' })
+                : h('span', { class: 'num-danger', text: '明细相加与层级汇总不符，请检查层级关系与缺测。' })
+    ]));
+    return h('div', { class: 'diff-note' }, nodes);
+  }
+
+  async function renderReconcile() {
+    if (!reconcileState.month) reconcileState.month = state.month;
+    var f = clear(document.getElementById('filters-reconcile'));
+    var mi = h('input', { type: 'month' });
+    mi.value = reconcileState.month;
+    mi.addEventListener('change', function () { reconcileState.month = mi.value; renderReconcile(); });
+    f.appendChild(h('div', { class: 'filter-box' }, [
+      h('div', { class: 'filter-title', text: '层级核对' }),
+      h('div', { class: 'field' }, [h('label', { text: '月份' }), mi]),
+      h('div', { class: 'field' }, [h('button', { type: 'button', class: 'btn btn-sm btn-ghost', text: '重新核对', onclick: function () { renderReconcile(); } })])
+    ]));
+
+    var c = clear(document.getElementById('content-reconcile'));
+    var data;
+    try { data = await api('GET', '/api/reconcile' + qs({ month: reconcileState.month })); }
+    catch (e) { showError(e); c.appendChild(h('div', { class: 'empty', text: '加载失败：' + e.message })); return; }
+
+    c.appendChild(h('div', { class: 'card' }, [
+      h('div', { class: 'card-head' }, [h('h2', { text: '总量口径（去重规则）' })]),
+      h('div', { class: 'card-body' }, [
+        h('div', { class: 'section-note basis-rule', text: data.basisRule }),
+        h('div', { class: 'section-note', text: '“平铺合计”把所有排口实测直接相加（含重复）；“去重后合计”是单位/集团上报与横向比较口径；“重复差额 = 平铺合计 − 去重后合计”，即车间排口与总排口重复计量的那一股水；“逐排口明细相加”只把判定为计入的排口实测相加，必须等于去重后合计、差额为 0 才算核对通过。' })
+      ])
+    ]));
+
+    c.appendChild(h('div', { class: 'card' }, [
+      h('div', { class: 'card-head' }, [
+        h('h2', { text: '集团级一键核对' }),
+        h('span', { class: 'sub', text: '月份 ' + data.month + ' · 共 ' + data.plants.length + ' 家单位（单位级核对见下方各单位）' })
+      ]),
+      h('div', { class: 'table-wrap' }, reconcileTotalsTable(data.totals))
+    ]));
+
+    data.plants.forEach(function (pr) {
+      var allMatched = ['COD', '氨氮'].every(function (mt) { return pr.rows[mt].matched; });
+      c.appendChild(h('div', { class: 'card' }, [
+        h('div', { class: 'card-head' }, [
+          h('h2', { text: pr.plant ? pr.plant.code + ' ' + pr.plant.name : '单位' }),
+          h('span', { class: 'tag ' + (allMatched ? 'tag-ok' : 'tag-danger'),
+            text: allMatched ? '明细相加 = 层级汇总 · 核对一致' : '核对不一致' })
+        ]),
+        h('div', { class: 'card-body' }, [
+          h('div', { class: 'diff-grid' }, [diffSourceNote(pr, 'COD'), diffSourceNote(pr, '氨氮')]),
+          h('div', { class: 'table-wrap' }, reconcileOutletTable(pr))
+        ])
+      ]));
+    });
   }
 
   /* ================= 设置 ================= */

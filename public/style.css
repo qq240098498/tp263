@@ -387,3 +387,15 @@ tr.expand-row > td {
 .summary-cell .v { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .mini-table table { font-size: 12px; }
 .inline-actions { display: flex; gap: 6px; }
+/* 层级与核对 */
+.tag-muted { background: #eef0f3; border-color: #d8dce2; color: var(--ink-3); }
+.tag-mini { font-size: 11px; padding: 1px 6px; font-weight: normal; white-space: nowrap; }
+.muted { color: var(--ink-3); white-space: pre; }
+.row-child td:first-child { background: #faf8f4; }
+.num-ok { color: var(--ok); }
+.basis-rule { padding: 8px 10px; background: var(--accent-soft); border-left: 3px solid var(--accent); border-radius: 2px; color: var(--ink); margin-bottom: 8px; }
+.diff-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 10px; }
+.diff-note { border: 1px solid #e6e2da; border-radius: 4px; padding: 8px 10px; background: #fffdf9; }
+.diff-note .hint { margin-top: 4px; line-height: 1.6; }
+.notice-card .card-body { padding-top: 10px; padding-bottom: 10px; }
+@media (max-width: 900px) { .diff-grid { grid-template-columns: 1fr; } }
